@@ -1,0 +1,30 @@
+# OFFICEMATES BACKEND - PYTHON DEPENDENCIES
+# Core - Install these first
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+websockets
+
+# LiveKit
+livekit-api
+PyJWT
+
+# Google AI
+google-generativeai
+
+# HTTP
+requests
+httpx
+aiohttp
+
+# Environment
+python-dotenv
+
+# OpenCV for distraction detection (legacy - being migrated to MediaPipe)
+opencv-python
+numpy
+pillow
+
+# MediaPipe for robust face detection and object recognition
+mediapipe>=0.10.0

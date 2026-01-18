@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version:*)",
+      "Bash(pip3 install:*)",
+      "Bash(npm install)",
+      "Bash(python3:*)",
+      "Bash(source:*)",
+      "Bash(pip install:*)",
+      "Bash(./venv/bin/pip install:*)",
+      "Bash(../venv/bin/python -m uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(npm run dev:*)",
+      "Bash(tree:*)",
+      "Bash(npm run build:*)",
+      "Bash(pkill:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(npx tsc:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:opennote.com)",
+      "WebSearch",
+      "WebFetch(domain:docs.opennote.com)",
+      "Bash(SESSION_ID=\"fe152e30-4ffe-4787-a293-2f476ed1f26f\":*)",
+      "Bash(__NEW_LINE_c33f0da33beeb070__ echo \"=== TEST 2: Record Learning Interaction ===\")",
+      "Bash(__NEW_LINE_c33f0da33beeb070__ echo \"\")",
+      "Bash(__NEW_LINE_03a46002d6f5f06e__ echo \"=== TEST 5: Report Confusion \\(Triggers Auto Video\\) ===\")",
+      "Bash(__NEW_LINE_03a46002d6f5f06e__ echo \"\")",
+      "Bash(SESSION_ID=\"d6ff3e2c-0a9f-4e9a-afc7-e3091252bc38\")",
+      "Bash(__NEW_LINE_32de471620af3194__ echo \"4. Triggering confusion \\(should auto-generate video\\)...\")",
+      "Bash(__NEW_LINE_32de471620af3194__ echo \"\")",
+      "Bash(__NEW_LINE_406e77ea7a4ffe10__ echo \"\")",
+      "Bash(__NEW_LINE_247c901e653069ae__ echo \"\")",
+      "Bash(__NEW_LINE_7922fe55585e96d0__ echo \"\")"
+    ]
+  }
+}
