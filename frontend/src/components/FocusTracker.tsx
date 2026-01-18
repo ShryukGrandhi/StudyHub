@@ -76,8 +76,11 @@ export const FocusTracker: React.FC<FocusTrackerProps> = ({
 
                 if (result.distraction_detected) {
                     setStatus(`Distracted: ${result.intervention || "Focus!"}`);
-                    if (onDistraction && result.intervention) {
-                        onDistraction(result.distraction_type, result.intervention);
+                    // Call onDistraction when distraction is detected, even without intervention message
+                    // This enables video auto-generation for sustained distraction
+                    if (onDistraction) {
+                        const distractionMsg = result.intervention || `Distraction detected: ${result.distraction_type || 'looking away'}`;
+                        onDistraction(result.distraction_type || 'looking_away', distractionMsg);
                     }
                 } else {
                     setStatus("Focused ✅");

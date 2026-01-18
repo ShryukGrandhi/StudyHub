@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { FocusTracker } from '../components/FocusTracker';
 import { CodeViewer } from '../components/CodeViewer';
+import { ChatFlashcards } from '../components/ChatFlashcards';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -53,6 +54,9 @@ interface ChatMessage {
   timestamp: Date;
   isCorrect?: boolean;
   videoUrl?: string;
+  visualType?: 'none' | 'video' | 'flashcards' | 'practice';
+  visual?: any;
+  sources?: { title: string; url: string }[];
 }
 
 interface Problem {
@@ -177,7 +181,7 @@ const ROOMS: Room[] = [
   },
   {
     id: 'focus',
-    name: 'Focus Room',
+    name: 'FocusRoom',
     color: '#9b59b6',
     x: 450,
     y: 450,
@@ -285,6 +289,16 @@ export default function StudyWorld() {
   const [distractionWarning, setDistractionWarning] = useState('');
   const [showDebugOverlay, setShowDebugOverlay] = useState(true); // Default ON to show CV visualization
   const [debugImage, setDebugImage] = useState('');
+
+  // Auto-engagement video generation state (for distraction response)
+  const [lastContext, setLastContext] = useState<{ topic: string; response: string; timestamp: number } | null>(null);
+  const lastContextRef = useRef<{ topic: string; response: string; timestamp: number } | null>(null);
+  const [isAutoGeneratingVideo, setIsAutoGeneratingVideo] = useState(false);
+
+  // Keep ref in sync with state (for use in intervals/callbacks)
+  useEffect(() => {
+    lastContextRef.current = lastContext;
+  }, [lastContext]);
 
   // Code Viewer state
   const [codeViewerData, setCodeViewerData] = useState<{ code: string, isVisual: boolean } | null>(null);
@@ -662,16 +676,17 @@ export default function StudyWorld() {
     });
 
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
+      // Use Smart Chat API to support explicit commands and force execution
+      const response = await fetch('http://localhost:8000/api/focus/smart-chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_id: userId,
-          department: selectedSpecialist.department,
-          specialist_id: selectedSpecialist.id,
           message: inputText,
-          context: chatMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
-          student_progress: studentProgress
+          current_topic: selectedSpecialist.department,
+          behavior_state: 'focused', // Force focused state to bypass refusal logic
+          // Pass extra context if needed, though mostly handled by backend now
+          session_id: null
         })
       });
 
@@ -684,8 +699,71 @@ export default function StudyWorld() {
         role: 'assistant',
         content: data.response || 'I encountered an issue. Please try again.',
         specialist: selectedSpecialist.id,
-        timestamp: new Date()
+        timestamp: new Date(),
+        visual: data.visual_generated,
+        sources: data.sources
       }]);
+
+      // Save context for distraction-based auto video generation
+      // Use the question topic if available, otherwise fall back to department
+      const questionTopic = userMessage.content.slice(0, 100).replace(/[?!.,]/g, '').trim();
+      const contextToSet = {
+        topic: questionTopic || selectedSpecialist.department || 'the current topic',
+        response: data.response || '',
+        timestamp: Date.now()
+      };
+      console.log('📝 [Context] Setting lastContext for distraction video:', contextToSet.topic);
+      setLastContext(contextToSet);
+
+      // If a video was generated, poll for the actual s3_url
+      if (data.visual_generated?.type === 'video' && data.visual_generated?.id) {
+        const videoId = data.visual_generated.id;
+        const pollVideoForUrl = async () => {
+          try {
+            const statusResponse = await fetch(`http://localhost:8000/api/opennote/video/status/${videoId}`);
+            const statusData = await statusResponse.json();
+
+            if (statusData.status === 'completed' && statusData.response?.s3_url) {
+              // Update the chat message with the actual video URL
+              setChatMessages(prev => prev.map(msg => {
+                if (msg.id === responseId && msg.visual?.id === videoId) {
+                  return {
+                    ...msg,
+                    visual: {
+                      ...msg.visual,
+                      status: 'ready',
+                      videoUrl: statusData.response.s3_url
+                    }
+                  };
+                }
+                return msg;
+              }));
+            } else if (statusData.status === 'failed') {
+              // Mark video as failed
+              setChatMessages(prev => prev.map(msg => {
+                if (msg.id === responseId && msg.visual?.id === videoId) {
+                  return {
+                    ...msg,
+                    visual: {
+                      ...msg.visual,
+                      status: 'error',
+                      errorMessage: statusData.message || 'Video generation failed'
+                    }
+                  };
+                }
+                return msg;
+              }));
+            } else if (statusData.status === 'pending') {
+              // Still processing, poll again in 5 seconds
+              setTimeout(pollVideoForUrl, 5000);
+            }
+          } catch (err) {
+            console.error('Failed to poll video status:', err);
+          }
+        };
+        // Start polling after a short delay
+        setTimeout(pollVideoForUrl, 3000);
+      }
 
       if (data.decision_log) {
         setDecisionLogs(prev => [data.decision_log, ...prev]);
@@ -1777,6 +1855,62 @@ export default function StudyWorld() {
               }
               return prev;
             });
+
+            // AUTO-GENERATE VIDEO when distraction is detected with intervention
+            // ONLY trigger if we have context from a recent AI response (within 2 minutes)
+            // This prevents spam - video only generates ONCE after each answer
+            // NOTE: Using ref instead of state to avoid stale closure in interval
+            const currentContext = lastContextRef.current;
+            const contextAge = currentContext ? (Date.now() - currentContext.timestamp) / 1000 : Infinity;
+            const recentEnough = contextAge < 120; // Within 2 minutes
+
+            console.log('👁️ [AntiGravity] Distraction detected:', {
+              hasLastContext: !!currentContext,
+              lastContextTopic: currentContext?.topic,
+              contextAgeSeconds: Math.round(contextAge),
+              recentEnough,
+              willTriggerVideo: !!(currentContext && recentEnough)
+            });
+
+            // ONLY generate video if we have recent context from an AI answer
+            if (currentContext && recentEnough) {
+              console.log('🎬 [AntiGravity] Auto-generating video for distracted student:', currentContext.topic);
+
+              // Clear context IMMEDIATELY to prevent re-triggers
+              const topicToUse = currentContext.topic;
+              const responseToUse = currentContext.response;
+              setLastContext(null);
+              lastContextRef.current = null;
+
+              // Call behavior-trigger API
+              fetch('http://localhost:8000/api/focus/behavior-trigger', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  user_id: userId,
+                  session_id: null,
+                  behavior: 'distracted',
+                  last_topic: topicToUse,
+                  last_response: responseToUse.slice(0, 500),
+                  trigger_source: 'antigravity'
+                })
+              })
+                .then(res => res.json())
+                .then(result => {
+                  console.log('🎬 [AntiGravity] Video generation result:', result);
+                  if (result.success && result.visual_generated) {
+                    const videoMessage: ChatMessage = {
+                      id: `auto-video-${Date.now()}`,
+                      role: 'system',
+                      content: result.message || `👋 I noticed you got distracted! Here's a video to help you stay engaged with ${topicToUse}.`,
+                      timestamp: new Date(),
+                      visual: result.visual_generated
+                    };
+                    setChatMessages(prev => [...prev, videoMessage]);
+                  }
+                })
+                .catch(err => console.error('Failed to auto-generate video:', err));
+            }
           }
         } else {
           // Smooth decay: decrease gradually when not distracted
@@ -2132,7 +2266,7 @@ export default function StudyWorld() {
         <div className="focus-room-header">
           <div className="focus-room-title">
             <span className="focus-icon">🎯</span>
-            <h1>AntiGravity Focus Room</h1>
+            <h1>FocusRoom</h1>
             <span className="focus-subtitle">Behavior-Aware Learning Environment</span>
           </div>
           <div className="focus-room-stats">
@@ -2150,7 +2284,7 @@ export default function StudyWorld() {
             </div>
           </div>
           <button className="exit-focus-room" onClick={() => { endFocusMode(false); setActiveMode(null); }}>
-            ← Exit Focus Room
+            ← Exit FocusRoom
           </button>
         </div>
 
@@ -2266,6 +2400,95 @@ export default function StudyWorld() {
                       {msg.role === 'user' ? '👤 You' : msg.role === 'assistant' ? `🤖 ${msg.specialist || 'AI'}` : '📢'}
                     </span>
                     <p>{msg.content}</p>
+                    {msg.visual && (
+                      <div className="fr-visual-widget" style={{
+                        marginTop: '10px',
+                        background: 'rgba(255,255,255,0.1)',
+                        padding: '10px',
+                        borderRadius: '8px',
+                        border: '1px solid rgba(255,255,255,0.2)'
+                      }}>
+                        {msg.visual.type === 'video' ? (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <span style={{ fontSize: '24px' }}>🎥</span>
+                            <div>
+                              <strong style={{ color: '#fff' }}>
+                                {msg.visual.status === 'ready' ? 'Video Ready' :
+                                  msg.visual.status === 'error' ? 'Video Failed' :
+                                    'Video Generating...'}
+                              </strong>
+                              <div style={{ fontSize: '0.9em', opacity: 0.8 }}>{msg.visual.topic || 'Concept Explanation'}</div>
+                              {msg.visual.videoUrl ? (
+                                <button
+                                  onClick={() => window.open(msg.visual.videoUrl, '_blank')}
+                                  style={{
+                                    marginTop: '5px',
+                                    background: '#e94560',
+                                    border: 'none',
+                                    color: 'white',
+                                    padding: '4px 8px',
+                                    borderRadius: '4px',
+                                    cursor: 'pointer'
+                                  }}>Watch Video ↗</button>
+                              ) : msg.visual.status === 'error' ? (
+                                <div style={{ marginTop: '5px', color: '#ff6b6b', fontSize: '0.85em' }}>
+                                  {msg.visual.errorMessage || 'Video generation failed'}
+                                </div>
+                              ) : (
+                                <div style={{ marginTop: '5px', color: '#ffd93d', fontSize: '0.85em' }}>
+                                  ⏳ Processing... (usually takes 30-60 seconds)
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                              <span style={{ fontSize: '24px' }}>🃏</span>
+                              <div>
+                                <strong style={{ color: '#fff' }}>
+                                  {msg.visual.type === 'flashcards' ? 'Flashcards Created' : 'Practice Set Ready'}
+                                </strong>
+                                <div style={{ fontSize: '0.9em', opacity: 0.8 }}>{msg.visual.message}</div>
+                              </div>
+                            </div>
+
+                            {/* Render Preview */}
+                            {/* Render Interactive Flashcards */}
+                            {msg.visual.preview && Object.keys(msg.visual.preview).length > 0 && (
+                              <ChatFlashcards
+                                data={msg.visual.preview}
+                                topic={msg.visual.topic || msg.visual.message || 'Key Concepts'}
+                              />
+                            )}
+
+                            {msg.visual.id && <div style={{
+                              marginTop: '2px',
+                              fontSize: '0.8em',
+                              color: '#4cc9f0',
+                              textAlign: 'right'
+                            }}>Successfully saved to OpenNote ✅</div>}
+                          </div>
+                        )}
+
+                        {/* Source Citations */}
+                        {msg.sources && msg.sources.length > 0 && (
+                          <div style={{
+                            marginTop: '10px',
+                            paddingTop: '8px',
+                            borderTop: '1px solid rgba(255,255,255,0.1)',
+                            fontSize: '0.75em',
+                            opacity: 0.8
+                          }}>
+                            {msg.sources.map((s, i) => (
+                              <div key={i} style={{ marginBottom: '2px' }}>
+                                🔗 Source: <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color: '#4cc9f0', textDecoration: 'underline' }}>{s.title}</a>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
                 {chatMessages.length === 0 && (
@@ -3070,7 +3293,7 @@ export default function StudyWorld() {
             cursor: pointer;
           }
         `}</style>
-      </div>
+      </div >
     );
   }
 
@@ -3654,7 +3877,7 @@ export default function StudyWorld() {
       {/* Focus Room Panel - AntiGravity Orchestration */}
       {currentRoom?.id === 'focus' && !selectedSpecialist && (
         <div className="focus-panel">
-          <h3>🎯 AntiGravity Focus Room</h3>
+          <h3>🎯 FocusRoom</h3>
           <p style={{ fontSize: '8px', color: '#9b59b6', marginBottom: '10px' }}>Behavior-Aware Learning Environment</p>
 
           {!focusActive ? (
@@ -5604,9 +5827,96 @@ export default function StudyWorld() {
       <FocusTracker
         userId={userId}
         isActive={currentRoom?.id === 'focus'}
-        onDistraction={(type, msg) => {
+        onDistraction={async (type, msg) => {
           setDistractionWarning(msg);
           setTimeout(() => setDistractionWarning(''), 5000);
+
+          // Auto-generate video to re-engage distracted student
+          // Only trigger if:
+          // 1. We have context from a recent response (within last 2 minutes)
+          // 2. We're not already generating a video
+          // 3. The type indicates real distraction (not just brief glances)
+          const contextAge = lastContext ? (Date.now() - lastContext.timestamp) / 1000 : Infinity;
+          const recentEnough = contextAge < 120; // Within 2 minutes
+
+          // Debug logging to diagnose distraction-to-video pipeline
+          console.log('👁️ Distraction detected:', {
+            type,
+            msg,
+            hasLastContext: !!lastContext,
+            lastContextTopic: lastContext?.topic,
+            contextAgeSeconds: contextAge,
+            recentEnough,
+            isAutoGeneratingVideo
+          });
+
+          if (lastContext && recentEnough && !isAutoGeneratingVideo) {
+            // Note: removed type !== 'brief_glance' check since backend never returns that type
+            setIsAutoGeneratingVideo(true);
+
+            try {
+              console.log('🎬 Auto-generating video for distracted student:', lastContext.topic);
+
+              const response = await fetch('http://localhost:8000/api/focus/behavior-trigger', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  user_id: userId,
+                  session_id: null,
+                  behavior: 'distracted',
+                  last_topic: lastContext.topic,
+                  last_response: lastContext.response.slice(0, 500), // Truncate for API
+                  trigger_source: 'focus_tracker'
+                })
+              });
+
+              const data = await response.json();
+
+              if (data.success && data.visual_generated) {
+                // Add system message with the auto-generated video
+                const videoMessage: ChatMessage = {
+                  id: `auto-video-${Date.now()}`,
+                  role: 'system',
+                  content: data.message || `👋 I noticed you got distracted! Here's a video to help you stay engaged with ${lastContext.topic}.`,
+                  timestamp: new Date(),
+                  visual: data.visual_generated
+                };
+
+                setChatMessages(prev => [...prev, videoMessage]);
+
+                // Poll for video URL if it's processing
+                if (data.visual_generated.type === 'video' && data.visual_generated.id) {
+                  const pollVideoUrl = async () => {
+                    try {
+                      const statusRes = await fetch(`http://localhost:8000/api/opennote/video/status/${data.visual_generated.id}`);
+                      const statusData = await statusRes.json();
+
+                      if (statusData.status === 'completed' && statusData.response?.s3_url) {
+                        setChatMessages(prev => prev.map(msg =>
+                          msg.id === videoMessage.id
+                            ? { ...msg, visual: { ...msg.visual, status: 'ready', videoUrl: statusData.response.s3_url } }
+                            : msg
+                        ));
+                      } else if (statusData.status === 'pending') {
+                        setTimeout(pollVideoUrl, 5000);
+                      }
+                    } catch (e) {
+                      console.error('Failed to poll video status:', e);
+                    }
+                  };
+                  setTimeout(pollVideoUrl, 3000);
+                }
+
+                // Clear the context so we don't re-trigger on same answer
+                setLastContext(null);
+              }
+            } catch (error) {
+              console.error('Failed to auto-generate video:', error);
+            } finally {
+              // Cooldown to prevent rapid re-triggers
+              setTimeout(() => setIsAutoGeneratingVideo(false), 30000);
+            }
+          }
         }}
       />
 

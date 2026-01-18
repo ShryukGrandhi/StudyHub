@@ -31,7 +31,13 @@
       "Bash(__NEW_LINE_32de471620af3194__ echo \"\")",
       "Bash(__NEW_LINE_406e77ea7a4ffe10__ echo \"\")",
       "Bash(__NEW_LINE_247c901e653069ae__ echo \"\")",
-      "Bash(__NEW_LINE_7922fe55585e96d0__ echo \"\")"
+      "Bash(__NEW_LINE_7922fe55585e96d0__ echo \"\")",
+      "Bash(tail:*)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(./venv/bin/pip show:*)",
+      "Bash(kill:*)",
+      "Bash(ss:*)"
     ]
   }
 }

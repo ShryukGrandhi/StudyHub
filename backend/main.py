@@ -42,22 +42,35 @@ logger = logging.getLogger("officemates")
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     import mediapipe as mp
-    mp_face_mesh = mp.solutions.face_mesh
-    mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
-    
-    # Global FaceMesh instance for efficient reuse
-    FACE_MESH = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-    logger.info("✓ MediaPipe FaceMesh loaded for emotion detection")
-    MEDIAPIPE_AVAILABLE = True
-except ImportError as e:
+    # Check if solutions API is available (older mediapipe versions)
+    if hasattr(mp, 'solutions'):
+        mp_face_mesh = mp.solutions.face_mesh
+        mp_drawing = mp.solutions.drawing_utils
+        mp_drawing_styles = mp.solutions.drawing_styles
+
+        # Global FaceMesh instance for efficient reuse
+        FACE_MESH = mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        logger.info("✓ MediaPipe FaceMesh loaded for emotion detection")
+        MEDIAPIPE_AVAILABLE = True
+    else:
+        # Newer mediapipe versions have different API - fall back to OpenCV
+        logger.warning("MediaPipe solutions API not available (new API version), using OpenCV")
+        FACE_MESH = None
+        mp_face_mesh = None
+        mp_drawing = None
+        mp_drawing_styles = None
+        MEDIAPIPE_AVAILABLE = False
+except (ImportError, AttributeError) as e:
     logger.warning(f"MediaPipe not available, falling back to OpenCV: {e}")
     FACE_MESH = None
+    mp_face_mesh = None
+    mp_drawing = None
+    mp_drawing_styles = None
     MEDIAPIPE_AVAILABLE = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2588,12 +2601,25 @@ async def generate_visual_for_context(
                 "topic": topic,
                 "message": f"🃏 Created flashcard set for '{topic}'"
             })
+            
+            # Extract preview
+            preview = {}
+            cards = result.get("flashcards", [])
+            if cards:
+                for card in cards[:3]:
+                    preview[card.get("front", "Question")] = card.get("back", "Answer")
+            elif result.get("cards"): # Check alternative key
+                for card in result.get("cards")[:3]:
+                    preview[card.get("front", "Question")] = card.get("back", "Answer")
+
             return {
                 "type": "flashcards",
                 "id": result.get("set_id"),
                 "status": "created" if result.get("set_id") else "failed",
                 "message": f"Created flashcards for {topic}",
-                "data": result
+                "data": result,
+                "preview": preview,
+                "topic": topic
             }
 
         elif visual_type == "video":
@@ -2618,7 +2644,8 @@ async def generate_visual_for_context(
                 "id": result.get("video_id"),
                 "status": "processing" if result.get("video_id") else "failed",
                 "message": f"Generating video explanation for {topic}",
-                "data": result
+                "data": result,
+                "topic": topic
             }
 
         elif visual_type == "practice":
@@ -2633,12 +2660,22 @@ async def generate_visual_for_context(
                 "topic": topic,
                 "message": f"📝 Created practice problems for '{topic}'"
             })
+            
+            # Extract preview
+            preview = {}
+            questions = result.get("questions", [])
+            if questions:
+                for q in questions[:3]:
+                    preview[q.get("question", "Problem")] = q.get("correct_answer", "Solution")
+
             return {
                 "type": "practice",
                 "id": result.get("set_id"),
                 "status": "created" if result.get("set_id") else "failed",
                 "message": f"Created practice problems for {topic}",
-                "data": result
+                "data": result,
+                "preview": preview,
+                "topic": topic
             }
 
     except Exception as e:
@@ -2744,16 +2781,114 @@ async def focus_smart_chat(request: SmartChatRequest):
 
     # Step 2: Normal chat - get AI response
     try:
+        # Retrieve context from OpenNote (The Reading Loop)
+        opennote_context = ""
+        search_candidates = [request.message]
+        if request.current_topic:
+            search_candidates.append(request.current_topic)
+        if extracted_topic:
+            search_candidates.append(extracted_topic)
+            
+        search_text = " ".join(search_candidates).lower()
+        logger.info(f"🔍 Context Search: '{search_text}'")
+        
+        # Smart search in journals
+        used_sources = []
+        
+        try:
+            journals_resp = await opennote_api.journals_list()
+            journals = []
+            if journals_resp and isinstance(journals_resp, dict) and "journals" in journals_resp:
+                journals = journals_resp["journals"]
+            
+            logger.info(f"📚 Found {len(journals)} journals to scan.")
+            
+            if journals and isinstance(journals, list):
+                found_context = []
+                
+                # Check for Recent Focus Session (for continuity)
+                recent_mechanic_logs = [j for j in journals if "Focus Session" in j.get('title', '')]
+                if recent_mechanic_logs:
+                    # Sort logic implicitly handled if API returns newest first, or just take first
+                    last_session = recent_mechanic_logs[0] 
+                    try:
+                         session_res = await opennote_api.journals_content(last_session.get('id'))
+                         stext = session_res.get('content', '') if isinstance(session_res, dict) else str(session_res)
+                         if stext:
+                             found_context.append(f"--- RECENT LEARNING HISTORY (From '{last_session.get('title')}') ---\n{stext[:600]}...")
+                             used_sources.append({
+                                 "title": last_session.get('title'),
+                                 "url": f"https://opennote.me/journal/{last_session.get('id')}"
+                             })
+                    except Exception:
+                        pass
+
+                for j in journals:
+                    title = j.get('title', '')
+                    if not title or "Focus Session" in title: 
+                        continue
+                        
+                    # Robust matching logic
+                    is_match = False
+                    
+                    if title.lower() in search_text or (request.current_topic and request.current_topic.lower() in title.lower()):
+                         is_match = True
+                    else:
+                        keywords = [w for w in title.lower().split() if len(w) > 3]
+                        if any(k in search_text for k in keywords):
+                            is_match = True
+                            
+                    if is_match:
+                        logger.info(f"✅ Match found: '{title}'")
+                        content_res = await opennote_api.journals_content(j.get('id'))
+                        text = content_res.get('content', '') if isinstance(content_res, dict) else str(content_res)
+                        if text:
+                            found_context.append(f"--- From Journal '{title}' ---\n{text[:800]}")
+                            used_sources.append({
+                                "title": title,
+                                "url": f"https://opennote.me/journal/{j.get('id')}"
+                            })
+                            if len(found_context) >= 4:
+                                break
+                    else:
+                        logger.debug(f"❌ No match: '{title}'")
+                
+                if found_context:
+                    opennote_context = "\n\n".join(found_context)
+                    broadcast_activity("context_retrieved", {
+                        "topic": request.current_topic,
+                        "match_count": len(found_context),
+                        "message": f"📖 Using context from: {[s['title'] for s in used_sources]}"
+                    })
+                else:
+                    logger.info("ℹ️ No relevant journals found via search.")
+        except Exception as cx_err:
+            logger.error(f"Context retrieval failed: {cx_err}")
+
         model = genai.GenerativeModel('gemini-2.5-flash')
+
+        # DYNAMIC TOPIC ADJUSTMENT
+        effective_topic = request.current_topic or 'General'
+        if opennote_context and "Hamlet" in opennote_context: 
+             effective_topic += " (and User's Notes)"
 
         prompt = f"""You are a helpful, engaging tutor. Answer the student's question clearly and concisely.
 
-Topic context: {request.current_topic or 'General'}
-Student's question: {request.message}
+Current Class/Topic: {effective_topic}
+Student's Question: {request.message}
 
-Provide a clear, helpful response. Keep it under 200 words. If the concept is complex, break it down into steps."""
+CONTEXT FROM STUDENT'S NOTES (Prioritize this info):
+{opennote_context}
+
+Instructions:
+1. If the user asks about their notes, USE THE CONTEXT above.
+2. If previous session logs are present, USE THEM to adapt (e.g., "I see you struggled with X last time").
+3. Mention "According to your notes..." if using them.
+4. Keep answer under 200 words.
+"""
 
         response = model.generate_content(prompt)
+        result["sources"] = used_sources
         ai_response = response.text.strip()
         result["response"] = ai_response
 
@@ -4761,7 +4896,9 @@ async def analyze_focus(request: FocusAnalyzeRequest):
         else:
             # Fallback to Haar Cascades if MediaPipe not available
             face_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
+            eye_path = os.path.join(cv2.data.haarcascades, 'haarcascade_eye.xml')
             face_cascade = cv2.CascadeClassifier(face_path)
+            eye_cascade = cv2.CascadeClassifier(eye_path)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)
             
@@ -4844,14 +4981,18 @@ async def analyze_focus(request: FocusAnalyzeRequest):
             for (x, y, w, h) in faces:
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 3)
                 cv2.putText(frame, "FACE - FOCUSED", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # Draw eyes if detected (for visual feedback, but not used for detection)
-                roi_gray = gray[y:y+h, x:x+w]
-                roi_color = frame[y:y+h, x:x+w]
-                eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
-                
-                for (ex, ey, ew, eh) in eyes:
-                    cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (255, 255, 0), 2)
+
+                # Draw eyes if detected (for visual feedback only, not used for detection)
+                # Only works in Haar cascade fallback mode where gray/eye_cascade are defined
+                try:
+                    roi_gray = gray[y:y+h, x:x+w]
+                    roi_color = frame[y:y+h, x:x+w]
+                    eyes = eye_cascade.detectMultiScale(roi_gray, 1.1, 3)
+
+                    for (ex, ey, ew, eh) in eyes:
+                        cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (255, 255, 0), 2)
+                except (NameError, Exception):
+                    pass  # Eye detection is optional - only works in Haar cascade mode
 
         # Encode processed debug image
         _, buffer = cv2.imencode('.jpg', frame)

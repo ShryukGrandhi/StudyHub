@@ -72,6 +72,7 @@ interface VideoGeneration {
     videoId: string;
     status: 'processing' | 'ready' | 'error';
     topic: string;
+    videoUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -125,7 +126,7 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
         setSession(prev => ({ ...prev, status: 'starting' }));
 
         try {
-            const response = await fetch('/api/focus/session/start', {
+            const response = await fetch('http://localhost:8000/api/focus/session/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -165,7 +166,7 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
         setSession(prev => ({ ...prev, status: 'ending' }));
 
         try {
-            const response = await fetch('/api/focus/session/end', {
+            const response = await fetch('http://localhost:8000/api/focus/session/end', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -225,25 +226,52 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
         }));
 
         try {
-            // First, get AI response (using existing chat endpoint)
-            const chatResponse = await fetch('/api/chat/adaptive-reprompt', {
+            // First, get AI response (using NEW smart-chat endpoint)
+            const chatResponse = await fetch('http://localhost:8000/api/focus/smart-chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     user_id: userId,
-                    input_text: question,
+                    session_id: session.sessionId,
+                    message: question,
                     current_topic: session.topic,
-                    specialist_id: 'study_hub'
+                    behavior_state: 'focused' // Force focused state to ensure compliance
                 })
             });
 
             const chatData = await chatResponse.json();
             const aiResponse = chatData.response || chatData.message || 'I understand. Let me help you with that.';
-            const confidence = chatData.confidence || 1.0;
-            const concepts = chatData.concepts || [];
+
+            // Handle auto-generated visuals
+            if (chatData.visual_generated) {
+                const visual = chatData.visual_generated;
+                if (visual.type === 'video' && visual.id) {
+                    setPendingVideo({
+                        videoId: visual.id,
+                        status: 'processing',
+                        topic: visual.topic || session.topic
+                    });
+                    pollVideoStatus(visual.id);
+                } else if (visual.type === 'flashcards' || visual.type === 'practice') {
+                    // Add a system message about the generated content
+                    setSession(prev => ({
+                        ...prev,
+                        interactions: [...prev.interactions, {
+                            id: `sys-${Date.now()}`,
+                            timestamp: new Date().toISOString(),
+                            question: '', // System message
+                            response: `✨ ${visual.message}`,
+                            confidence: 1.0
+                        }]
+                    }));
+                }
+            }
+
+            const confidence = 1.0; // Smart chat is always confident
+            const concepts = [];
 
             // Record interaction in session
-            await fetch('/api/focus/session/interaction', {
+            await fetch('http://localhost:8000/api/focus/session/interaction', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -266,10 +294,9 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
                 conceptsCovered: [...new Set([...prev.conceptsCovered, ...concepts])]
             }));
 
-            // Check for confusion (low confidence triggers video)
-            if (confidence < 0.6) {
-                handleConfusion('low_confidence', aiResponse, session.topic);
-            }
+            // Check for confusion (low confidence triggers video) -> Now handled by smart-chat command detection
+            // but we keep this for manual triggers if needed
+            // if (confidence < 0.6) { ... } 
 
         } catch (err) {
             setError('Failed to get response');
@@ -291,7 +318,7 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
         if (!session.sessionId) return;
 
         try {
-            const response = await fetch('/api/focus/session/confusion', {
+            const response = await fetch('http://localhost:8000/api/focus/session/confusion', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -326,8 +353,14 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
                 const data = await response.json();
 
                 if (data.status === 'completed' || data.status === 'ready') {
-                    setPendingVideo(prev => prev ? { ...prev, status: 'ready' } : null);
-                } else if (data.status === 'error') {
+                    // Extract the s3_url from the response
+                    const videoUrl = data.response?.s3_url;
+                    setPendingVideo(prev => prev ? {
+                        ...prev,
+                        status: 'ready',
+                        videoUrl: videoUrl
+                    } : null);
+                } else if (data.status === 'error' || data.status === 'failed') {
                     setPendingVideo(prev => prev ? { ...prev, status: 'error' } : null);
                 } else {
                     // Still processing, check again in 5 seconds
@@ -350,14 +383,17 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
     }, [session.interactions, session.topic, handleConfusion]);
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // FOCUS TRACKER INTEGRATION
+    // FOCUS TRACKER INTEGRATION - AUTO VIDEO GENERATION ON DISTRACTION
     // ═══════════════════════════════════════════════════════════════════════════
+
+    const [isGeneratingDistractedVideo, setIsGeneratingDistractedVideo] = useState(false);
+    const lastVideoTriggerRef = useRef<number>(0);
 
     const handleDistraction = useCallback(async (type: string, message: string) => {
         if (!session.sessionId) return;
 
         // Log behavior to session
-        await fetch('/api/focus/session/behavior', {
+        await fetch('http://localhost:8000/api/focus/session/behavior', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -366,7 +402,69 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
                 data: { type, message }
             })
         });
-    }, [session.sessionId]);
+
+        // Auto-generate video to re-engage distracted student
+        // Requirements:
+        // 1. There was a recent interaction (student got an answer)
+        // 2. Not already generating a video
+        // 3. Cooldown of 30 seconds between triggers
+        const lastInteraction = session.interactions[session.interactions.length - 1];
+        const timeSinceLastTrigger = Date.now() - lastVideoTriggerRef.current;
+        const cooldownPassed = timeSinceLastTrigger > 30000; // 30 second cooldown
+
+        if (lastInteraction && lastInteraction.response && !isGeneratingDistractedVideo && cooldownPassed) {
+            setIsGeneratingDistractedVideo(true);
+            lastVideoTriggerRef.current = Date.now();
+
+            try {
+                console.log('🎬 FocusRoom: Auto-generating video for distracted student:', session.topic);
+
+                const response = await fetch('http://localhost:8000/api/focus/behavior-trigger', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        session_id: session.sessionId,
+                        behavior: 'distracted',
+                        last_topic: session.topic || 'the current topic',
+                        last_response: lastInteraction.response.slice(0, 500),
+                        trigger_source: 'focus_tracker'
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success && data.visual_generated?.type === 'video' && data.visual_generated?.id) {
+                    // Set pending video notification
+                    setPendingVideo({
+                        videoId: data.visual_generated.id,
+                        status: 'processing',
+                        topic: session.topic || 'Re-engagement Video'
+                    });
+
+                    // Poll for video URL
+                    pollVideoStatus(data.visual_generated.id);
+
+                    // Add a system interaction to show the video was triggered
+                    setSession(prev => ({
+                        ...prev,
+                        interactions: [...prev.interactions, {
+                            id: Date.now().toString(),
+                            timestamp: Date.now(),
+                            question: '',
+                            response: `👋 ${data.message || 'I noticed you got distracted! Here\'s a video to help you stay engaged.'}`,
+                            type: 'auto_video'
+                        }]
+                    }));
+                }
+            } catch (error) {
+                console.error('Failed to auto-generate distraction video:', error);
+            } finally {
+                // Clear the flag after some time
+                setTimeout(() => setIsGeneratingDistractedVideo(false), 10000);
+            }
+        }
+    }, [session.sessionId, session.interactions, session.topic, userId, isGeneratingDistractedVideo, pollVideoStatus]);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // RENDER
@@ -377,7 +475,7 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
         return (
             <div className="focus-room focus-room--idle">
                 <div className="focus-room__header">
-                    <h1>Focus Room</h1>
+                    <h1>FocusRoom</h1>
                     <p className="focus-room__subtitle">
                         Start a learning session. We'll remember where you left off.
                     </p>
@@ -566,7 +664,14 @@ export const FocusRoom: React.FC<FocusRoomProps> = ({
                         )}
                         {pendingVideo.status === 'ready' && (
                             <>
-                                Video ready! <a href="#">Watch now</a>
+                                Video ready!{' '}
+                                {pendingVideo.videoUrl ? (
+                                    <a href={pendingVideo.videoUrl} target="_blank" rel="noopener noreferrer">
+                                        Watch now ↗
+                                    </a>
+                                ) : (
+                                    <span>Loading URL...</span>
+                                )}
                             </>
                         )}
                         {pendingVideo.status === 'error' && (
